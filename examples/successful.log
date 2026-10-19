@@ -1,0 +1,9 @@
+2026-10-20T01:00:01.120Z [INFO] CheckoutService: Received checkout request req_98124a for user 8f2a1b9c-4e3d-4c2a-9a1b-3f4e5d6c7b8a
+2026-10-20T01:00:01.135Z [INFO] InventoryClient: Validating stock for 3 items
+2026-10-20T01:00:01.180Z [INFO] InventoryClient: Stock reserved successfully for order req_98124a
+2026-10-20T01:00:01.195Z [INFO] PricingEngine: Calculated tax and discounts for cart total $149.99
+2026-10-20T01:00:01.210Z [INFO] PaymentGateway: Initiating authorization with provider Stripe for amount 14999 cents
+2026-10-20T01:00:01.450Z [INFO] PaymentGateway: Payment authorized successfully. Transaction ID: txn_9918237461
+2026-10-20T01:00:01.465Z [INFO] OrderRepository: Storing order ORD-2026-8812 in PostgreSQL
+2026-10-20T01:00:01.490Z [INFO] NotificationService: Dispatching order confirmation email to customer
+2026-10-20T01:00:01.510Z [INFO] CheckoutService: Checkout completed successfully for req_98124a in 390ms

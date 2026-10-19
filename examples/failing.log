@@ -1,0 +1,15 @@
+2026-10-20T01:15:01.050Z [INFO] CheckoutService: Received checkout request req_77319c for user 8f2a1b9c-4e3d-4c2a-9a1b-3f4e5d6c7b8a
+2026-10-20T01:15:01.065Z [INFO] InventoryClient: Validating stock for 3 items
+2026-10-20T01:15:01.110Z [INFO] InventoryClient: Stock reserved successfully for order req_77319c
+2026-10-20T01:15:01.125Z [INFO] PricingEngine: Calculated tax and discounts for cart total $149.99
+2026-10-20T01:15:01.140Z [INFO] PaymentGateway: Initiating authorization with provider Stripe for amount 14999 cents
+2026-10-20T01:15:06.142Z [WARN] PaymentGateway: Request timed out after 5000ms. Attempting retry 1/3
+2026-10-20T01:15:11.145Z [WARN] PaymentGateway: Request timed out after 5000ms. Attempting retry 2/3
+2026-10-20T01:15:16.148Z [WARN] PaymentGateway: Request timed out after 5000ms. Attempting retry 3/3
+2026-10-20T01:15:21.150Z [ERROR] PaymentGateway: Failed to authorize transaction after 3 retries: GatewayTimeoutException: Read timeout from https://api.stripe.com/v1/charges
+    at com.store.payment.StripeClient.executeRequest(StripeClient.java:142)
+    at com.store.payment.StripeClient.authorize(StripeClient.java:88)
+    at com.store.checkout.CheckoutService.processPayment(CheckoutService.java:210)
+    at com.store.checkout.CheckoutService.handleCheckout(CheckoutService.java:115)
+2026-10-20T01:15:21.165Z [INFO] InventoryClient: Releasing reserved stock for order req_77319c due to payment failure
+2026-10-20T01:15:21.180Z [ERROR] CheckoutService: Order processing failed for req_77319c. Returning 504 GATEWAY_TIMEOUT to client
