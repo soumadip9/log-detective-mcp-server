@@ -1,4 +1,4 @@
-"""Tests for Phase 5 & 6: MCP server tool registration, discovery, health, and security."""
+"""Tests for MCP server tool registration, discovery, health, and security."""
 
 import asyncio
 import os
@@ -9,10 +9,12 @@ from log_detective.server import create_app, server
 
 
 def test_mcp_tool_discovery():
-    """Verify that all three tools are registered and advertised by the MCP server."""
+    """Verify that all five tools are registered and advertised by the MCP server."""
     tools = asyncio.run(server.list_tools())
     tool_names = [t.name for t in tools]
 
+    assert "list_log_sources" in tool_names
+    assert "read_logs" in tool_names
     assert "find_errors" in tool_names
     assert "get_log_context" in tool_names
     assert "compare_logs" in tool_names
@@ -30,6 +32,11 @@ def test_mcp_tool_execution():
     assert len(res.content) > 0
     text = res.content[0].text
     assert "Test error line" in text
+
+    # Test list_log_sources execution via MCP
+    res_sources = asyncio.run(server.call_tool("list_log_sources", {}))
+    assert not res_sources.is_error
+    assert len(res_sources.content) > 0
 
 
 def test_health_endpoint():

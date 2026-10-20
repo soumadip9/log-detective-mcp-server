@@ -1,4 +1,4 @@
-"""Hosted Log Detective MCP Server with Streamable HTTP transport and authentication."""
+"""Hosted Log Detective MCP Server with Streamable HTTP transport, source discovery, and authentication."""
 
 import logging
 import os
@@ -11,9 +11,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 import uvicorn
 
+from log_detective.sources.registry import default_registry
 from log_detective.tools import compare_logs as tool_compare_logs
 from log_detective.tools import find_errors as tool_find_errors
 from log_detective.tools import get_log_context as tool_get_log_context
+from log_detective.tools import list_log_sources as tool_list_log_sources
+from log_detective.tools import read_logs as tool_read_logs
 
 # Configure operational logging - Never log raw log text or credentials
 logging.basicConfig(
@@ -27,9 +30,9 @@ logger = logging.getLogger("log_detective.server")
 server = MCPServer(
     name="log-detective",
     instructions=(
-        "Log Detective MCP Server provides tools to investigate application logs. "
-        "AI clients should retrieve the relevant log text from authorized local or remote "
-        "sources and pass it to these tools to find errors, view context, or compare runs."
+        "Log Detective MCP Server provides tools to discover, retrieve, and investigate application logs. "
+        "AI clients can inspect authorized log sources with list_log_sources, read recent logs with read_logs, "
+        "and find errors, examine context, or compare runs using find_errors, get_log_context, and compare_logs."
     ),
 )
 
@@ -41,7 +44,7 @@ async def health_check(request: Any) -> JSONResponse:
         {
             "status": "healthy",
             "service": "log-detective-mcp",
-            "version": "1.0.0",
+            "version": "1.1.0",
         }
     )
 
@@ -52,7 +55,7 @@ async def root_info(request: Any) -> JSONResponse:
     return JSONResponse(
         {
             "service": "log-detective-mcp",
-            "description": "Log Detective MCP Server for application log investigation",
+            "description": "Log Detective MCP Server for multi-source application log investigation",
             "health_endpoint": "/health",
             "mcp_endpoint": "/mcp",
             "docs": "https://github.com/prasa/log-detective-mcp",
@@ -61,34 +64,95 @@ async def root_info(request: Any) -> JSONResponse:
 
 
 @server.tool(
+    name="list_log_sources",
+    description=(
+        "Discover the configured log sources that this server is authorized to read. "
+        "Returns safe metadata including source ID, name, source type (local_file, captured_process, "
+        "docker, remote_api), description, capabilities, and availability status. "
+        "Use this first to see what log sources are available for debugging."
+    ),
+)
+def list_log_sources() -> Dict[str, Any]:
+    """List all available log sources."""
+    logger.info("Executing list_log_sources")
+    try:
+        return tool_list_log_sources()
+    except Exception as exc:
+        logger.warning("list_log_sources error: %s", exc)
+        return {"error": str(exc), "status": "error"}
+
+
+@server.tool(
+    name="read_logs",
+    description=(
+        "Read recent logs from a configured log source with bounded limits and optional filters. "
+        "Supports filtering by severity (e.g. ERROR, WARN), search term, and line limits. "
+        "Returns normalized log entries, timestamps, components, stack traces, and raw previews."
+    ),
+)
+def read_logs(
+    source_id: str,
+    limit: int = 100,
+    severity: Optional[str] = None,
+    search_term: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read logs from a configured source ID."""
+    logger.info("Executing read_logs (source_id=%s, limit=%s, severity=%s)", source_id, limit, severity)
+    try:
+        return tool_read_logs(
+            source_id=source_id,
+            limit=limit,
+            severity=severity,
+            search_term=search_term,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    except (KeyError, FileNotFoundError) as exc:
+        logger.warning("read_logs resource not found: %s", exc)
+        return {"error": str(exc), "status": "not_found"}
+    except PermissionError as exc:
+        logger.warning("read_logs permission denied: %s", exc)
+        return {"error": str(exc), "status": "permission_denied"}
+    except (ValueError, TypeError) as exc:
+        logger.warning("read_logs validation error: %s", exc)
+        return {"error": str(exc), "status": "invalid_argument"}
+    except Exception as exc:
+        logger.error("read_logs execution failure: %s", exc)
+        return {"error": str(exc), "status": "execution_failed"}
+
+
+@server.tool(
     name="find_errors",
     description=(
-        "Scan log text (plain-text or JSON lines) for error events, stack traces, and failure indicators. "
-        "Returns line numbers, extracted error messages, timestamps, and stack traces. "
-        "Use this first when an incident or checkout/API failure is reported to locate all error events."
+        "Scan log text or a configured log source for error events, stack traces, and failure indicators. "
+        "Returns line numbers, extracted error messages, timestamps, components, and stack traces. "
+        "Accepts either 'source_id' to read from a configured source or direct 'log_text'."
     ),
 )
 def find_errors(
-    log_text: str,
+    log_text: Optional[str] = None,
+    source_id: Optional[str] = None,
     severity: str = "ERROR",
     limit: int = 50,
 ) -> Dict[str, Any]:
-    """Find errors within supplied log text.
-
-    Args:
-        log_text: Raw log text to inspect.
-        severity: Severity level to filter by (default 'ERROR'). Options: 'ERROR', 'WARN', 'CRITICAL', 'INFO', 'ALL'.
-        limit: Maximum number of matching entries to return (default 50, maximum 200).
-    """
-    logger.info("Executing find_errors (severity=%s, limit=%s)", severity, limit)
+    """Find errors within log text or from a configured log source."""
+    logger.info("Executing find_errors (source_id=%s, severity=%s, limit=%s)", source_id, severity, limit)
     try:
-        return tool_find_errors(log_text=log_text, severity=severity, limit=limit)
+        return tool_find_errors(log_text=log_text, source_id=source_id, severity=severity, limit=limit)
+    except (KeyError, FileNotFoundError) as exc:
+        logger.warning("find_errors resource not found: %s", exc)
+        return {"error": str(exc), "status": "not_found"}
+    except PermissionError as exc:
+        logger.warning("find_errors permission denied: %s", exc)
+        return {"error": str(exc), "status": "permission_denied"}
     except (ValueError, TypeError) as exc:
         logger.warning("find_errors validation error: %s", exc)
-        return {
-            "error": str(exc),
-            "status": "invalid_argument",
-        }
+        return {"error": str(exc), "status": "invalid_argument"}
+    except Exception as exc:
+        logger.error("find_errors failure: %s", exc)
+        return {"error": str(exc), "status": "execution_failed"}
 
 
 @server.tool(
@@ -96,30 +160,31 @@ def find_errors(
     description=(
         "Retrieve surrounding lines of context before and after a specific line number in a log. "
         "Preserves timestamps, stack traces, and highlights the target line. "
-        "Use this after find_errors to inspect what occurred immediately leading up to or following a specific failure."
+        "Accepts either 'source_id' to read from a configured source or direct 'log_text'."
     ),
 )
 def get_log_context(
-    log_text: str,
     target_line: int,
+    log_text: Optional[str] = None,
+    source_id: Optional[str] = None,
     context_size: int = 5,
 ) -> Dict[str, Any]:
-    """Retrieve lines surrounding a target line number.
-
-    Args:
-        log_text: Raw log text.
-        target_line: 1-indexed target line number.
-        context_size: Number of lines before and after to include (default 5, maximum 50).
-    """
-    logger.info("Executing get_log_context (target_line=%s, context_size=%s)", target_line, context_size)
+    """Retrieve lines surrounding a target line number."""
+    logger.info("Executing get_log_context (source_id=%s, target_line=%s, context_size=%s)", source_id, target_line, context_size)
     try:
-        return tool_get_log_context(log_text=log_text, target_line=target_line, context_size=context_size)
+        return tool_get_log_context(target_line=target_line, log_text=log_text, source_id=source_id, context_size=context_size)
+    except (KeyError, FileNotFoundError) as exc:
+        logger.warning("get_log_context resource not found: %s", exc)
+        return {"error": str(exc), "status": "not_found"}
+    except PermissionError as exc:
+        logger.warning("get_log_context permission denied: %s", exc)
+        return {"error": str(exc), "status": "permission_denied"}
     except (ValueError, TypeError) as exc:
         logger.warning("get_log_context validation error: %s", exc)
-        return {
-            "error": str(exc),
-            "status": "invalid_argument",
-        }
+        return {"error": str(exc), "status": "invalid_argument"}
+    except Exception as exc:
+        logger.error("get_log_context failure: %s", exc)
+        return {"error": str(exc), "status": "execution_failed"}
 
 
 @server.tool(
@@ -127,29 +192,36 @@ def get_log_context(
     description=(
         "Compare a healthy baseline log run against a failing log run to identify newly added errors, "
         "missing expected events, and frequency differences. "
-        "Normalizes timestamps and dynamic IDs across runs so underlying behavior can be compared directly. "
-        "Note: Highlights empirical differences without claiming direct causation."
+        "Accepts direct log text or source IDs ('baseline_source_id', 'failing_source_id')."
     ),
 )
 def compare_logs(
-    baseline_log: str,
-    failing_log: str,
+    baseline_log: Optional[str] = None,
+    failing_log: Optional[str] = None,
+    baseline_source_id: Optional[str] = None,
+    failing_source_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Compare baseline log against failing log.
-
-    Args:
-        baseline_log: Log content from a successful/normal run.
-        failing_log: Log content from the failing run.
-    """
-    logger.info("Executing compare_logs")
+    """Compare baseline log against failing log."""
+    logger.info("Executing compare_logs (baseline_source=%s, failing_source=%s)", baseline_source_id, failing_source_id)
     try:
-        return tool_compare_logs(baseline_log=baseline_log, failing_log=failing_log)
+        return tool_compare_logs(
+            baseline_log=baseline_log,
+            failing_log=failing_log,
+            baseline_source_id=baseline_source_id,
+            failing_source_id=failing_source_id,
+        )
+    except (KeyError, FileNotFoundError) as exc:
+        logger.warning("compare_logs resource not found: %s", exc)
+        return {"error": str(exc), "status": "not_found"}
+    except PermissionError as exc:
+        logger.warning("compare_logs permission denied: %s", exc)
+        return {"error": str(exc), "status": "permission_denied"}
     except (ValueError, TypeError) as exc:
         logger.warning("compare_logs validation error: %s", exc)
-        return {
-            "error": str(exc),
-            "status": "invalid_argument",
-        }
+        return {"error": str(exc), "status": "invalid_argument"}
+    except Exception as exc:
+        logger.error("compare_logs failure: %s", exc)
+        return {"error": str(exc), "status": "execution_failed"}
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -180,7 +252,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 def create_app() -> Any:
     """Create and configure the Starlette application with Streamable HTTP transport and middleware."""
-    # Disable DNS rebinding protection so requests from Render and remote reverse proxies pass through
+    default_registry.load_from_environment()
+
     transport_sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = server.streamable_http_app(
         streamable_http_path="/mcp",
@@ -192,6 +265,8 @@ def create_app() -> Any:
 
 def main() -> None:
     """Entrypoint to run the server on the configured PORT/HOST or stdio."""
+    default_registry.load_from_environment()
+
     if "--stdio" in sys.argv:
         server.run(transport="stdio")
         return
@@ -209,4 +284,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

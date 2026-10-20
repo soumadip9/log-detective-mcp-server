@@ -1,0 +1,47 @@
+{
+  "sources": [
+    {
+      "type": "local_file",
+      "source_id": "app-backend",
+      "name": "Backend Application Log",
+      "path": "examples/failing.log",
+      "allowed_root": "examples/",
+      "description": "Local application log file for checkout service"
+    },
+    {
+      "type": "local_file",
+      "source_id": "app-baseline",
+      "name": "Healthy Baseline Log",
+      "path": "examples/successful.log",
+      "allowed_root": "examples/",
+      "description": "Successful baseline checkout run"
+    },
+    {
+      "type": "captured_process",
+      "source_id": "worker-spool",
+      "name": "Background Worker Process",
+      "spool_file": "examples/failing.log",
+      "allowed_root": "examples/",
+      "process_name": "celery-worker",
+      "description": "Captured worker stdout/stderr spool file"
+    },
+    {
+      "type": "docker",
+      "source_id": "docker-api",
+      "name": "Docker API Container",
+      "container": "api-gateway",
+      "allowlisted_containers": ["api-gateway", "auth-service"],
+      "description": "Docker container logs for allowlisted service"
+    },
+    {
+      "type": "remote_api",
+      "source_id": "central-logs",
+      "name": "Central Log Cluster",
+      "endpoint_url": "https://logs.internal.mycompany.com/v1/query",
+      "allowed_domains": ["internal.mycompany.com"],
+      "auth_header": "Authorization",
+      "auth_token": "env:LOG_SERVICE_API_KEY",
+      "description": "Internal HTTP log aggregation endpoint"
+    }
+  ]
+}

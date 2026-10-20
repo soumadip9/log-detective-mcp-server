@@ -1,11 +1,11 @@
-"""Log parsing, normalization, and classification utilities."""
+"""Log parsing, normalization, and classification utilities for multi-language applications."""
 
 from dataclasses import dataclass, field
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-# Regex patterns for plain-text log parsing
+# Regex patterns for plain-text log parsing across Python, Node.js, Java, and Go
 TIMESTAMP_PATTERN = re.compile(
     r"\b(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?|"
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\b"
@@ -13,7 +13,7 @@ TIMESTAMP_PATTERN = re.compile(
 
 UUID_PATTERN = re.compile(r"\b[0-9a-fA-F]{4,}(?:-[0-9a-fA-F]{4,})+\b")
 HEX_PATTERN = re.compile(r"\b0x[0-9a-fA-F]+\b")
-REQUEST_ID_PATTERN = re.compile(r"\b(?:req_|req-|trace_|span_)[0-9a-zA-Z\-_]+\b", re.IGNORECASE)
+REQUEST_ID_PATTERN = re.compile(r"\b(?:req_|req-|trace_|span_|corr_)[0-9a-zA-Z\-_]+\b", re.IGNORECASE)
 EPHEMERAL_NUM_PATTERN = re.compile(r"\b\d{6,}\b")
 
 # Plain text severity regex matching markers like [ERROR], ERROR:, level=error, etc.
@@ -22,9 +22,24 @@ SEVERITY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-STACK_TRACE_LINE_PATTERN = re.compile(
-    r"^(?:\s+at\s+.*|\s+File\s+\".*|Traceback \(most recent call last\):|\s+.*Error:.*|Caused by:.*|\s+\.\.\.\s+\d+\s+more)",
+# Exception patterns that indicate multiline error continuations
+STACK_TRACE_START_PATTERN = re.compile(
+    r"^(?:"
+    r"\s+at\s+.*|"  # Node.js and Java
+    r"\s+File\s+\".*|"  # Python
+    r"Traceback \(most recent call last\):|"  # Python
+    r"Caused by:.*|"  # Java
+    r"\s+\.\.\.\s+\d+\s+more|"  # Java
+    r"\[signal SIG[A-Z0-9]+:.*|"  # Go
+    r"goroutine \d+ \[.*\]:|"  # Go
+    r"(?:[a-zA-Z0-9_\.]+\.)?[a-zA-Z0-9_]*(?:Exception|Error|Fault):.*"  # Java/Python unindented exception
+    r")",
     re.IGNORECASE,
+)
+
+# Common logger/component extraction patterns (e.g. [com.example.Service], (app.worker), [CheckoutClient]:)
+COMPONENT_PATTERN = re.compile(
+    r"(?:\[|\()([a-zA-Z0-9_\.\-\/]+(?:Service|Client|Worker|Controller|Handler|Engine|Repo|Repository|[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+))(?:\]|\))"
 )
 
 SEVERITY_HIERARCHY = {
@@ -46,7 +61,7 @@ SEVERITY_HIERARCHY = {
 
 @dataclass
 class LogEntry:
-    """Represents a parsed line from an application log."""
+    """Represents a normalized, parsed entry from any application log source."""
 
     line_number: int
     raw_content: str
@@ -54,6 +69,9 @@ class LogEntry:
     severity: Optional[str] = None
     message: str = ""
     timestamp: Optional[str] = None
+    component: Optional[str] = None
+    request_id: Optional[str] = None
+    source_id: Optional[str] = None
     stack_trace: List[str] = field(default_factory=list)
     parsed_json: Optional[Dict[str, Any]] = None
 
@@ -61,6 +79,27 @@ class LogEntry:
         """Return a normalized version of the message for comparison across runs."""
         msg = self.message if self.message else self.raw_content
         return normalize_log_line(msg)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert entry into serializable dictionary format for MCP consumers."""
+        data: Dict[str, Any] = {
+            "line": self.line_number,
+            "severity": self.severity or "UNKNOWN",
+            "message": self.message,
+            "timestamp": self.timestamp,
+            "raw": self.raw_content,
+        }
+        if self.component:
+            data["component"] = self.component
+        if self.request_id:
+            data["request_id"] = self.request_id
+        if self.source_id:
+            data["source_id"] = self.source_id
+        if self.stack_trace:
+            data["stack_trace"] = self.stack_trace
+        if self.is_json:
+            data["is_json"] = True
+        return data
 
 
 def normalize_log_line(text: str) -> str:
@@ -75,11 +114,11 @@ def normalize_log_line(text: str) -> str:
     return norm
 
 
-def parse_json_log_line(line: str) -> Optional[Tuple[Optional[str], str, Optional[str], Dict[str, Any]]]:
-    """Attempt to parse a line as JSON and extract severity, message, timestamp, and json dict.
+def parse_json_log_line(line: str) -> Optional[Tuple[Optional[str], str, Optional[str], Optional[str], Optional[str], Dict[str, Any]]]:
+    """Attempt to parse a line as structured JSON (Pino, Winston, Python json-logger, etc.).
 
     Returns:
-        (severity, message, timestamp, parsed_dict) or None if not JSON.
+        (severity, message, timestamp, component, request_id, parsed_dict) or None if not JSON.
     """
     stripped = line.strip()
     if not (stripped.startswith("{") and stripped.endswith("}")):
@@ -95,17 +134,23 @@ def parse_json_log_line(line: str) -> Optional[Tuple[Optional[str], str, Optiona
     # Severity lookup
     severity: Optional[str] = None
     for key in ("level", "severity", "log_level", "logLevel", "lvl"):
-        if key in data and isinstance(data[key], (str, int)):
+        if key in data and (isinstance(data[key], (str, int))):
             val = str(data[key]).upper()
             if val in SEVERITY_HIERARCHY:
                 severity = val
                 break
-            # Handle numeric syslog levels if any
-            if val in ("E", "ERR"):
+            # Handle numeric syslog / Pino levels
+            if val in ("50", "60", "E", "ERR"):
                 severity = "ERROR"
                 break
-            if val in ("W", "WRN"):
+            if val in ("40", "W", "WRN"):
                 severity = "WARN"
+                break
+            if val in ("30", "INFO"):
+                severity = "INFO"
+                break
+            if val in ("20", "DEBUG"):
+                severity = "DEBUG"
                 break
             severity = val
             break
@@ -127,7 +172,6 @@ def parse_json_log_line(line: str) -> Optional[Tuple[Optional[str], str, Optiona
             break
 
     if not message:
-        # Fallback to entire json representation
         message = stripped
 
     # Timestamp lookup
@@ -137,31 +181,48 @@ def parse_json_log_line(line: str) -> Optional[Tuple[Optional[str], str, Optiona
             timestamp = str(data[key])
             break
 
-    return severity, message, timestamp, data
+    # Component / Logger lookup
+    component: Optional[str] = None
+    for key in ("logger", "name", "component", "service", "module", "class", "caller"):
+        if key in data and data[key]:
+            component = str(data[key])
+            break
+
+    # Request / Correlation ID lookup
+    request_id: Optional[str] = None
+    for key in ("request_id", "requestId", "req_id", "reqId", "trace_id", "traceId", "correlation_id", "correlationId", "span_id"):
+        if key in data and data[key]:
+            request_id = str(data[key])
+            break
+
+    return severity, message, timestamp, component, request_id, data
 
 
-def parse_plaintext_log_line(line: str) -> Tuple[Optional[str], str, Optional[str]]:
-    """Parse a plain-text log line for severity, message, and timestamp."""
-    # Timestamp extraction
+def parse_plaintext_log_line(line: str) -> Tuple[Optional[str], str, Optional[str], Optional[str], Optional[str]]:
+    """Parse a plain-text log line for severity, message, timestamp, component, and request_id."""
     ts_match = TIMESTAMP_PATTERN.search(line)
     timestamp = ts_match.group(0) if ts_match else None
 
-    # Severity extraction
     severity: Optional[str] = None
     sev_match = SEVERITY_PATTERN.search(line)
     if sev_match:
         severity = sev_match.group(1).upper()
         if severity == "WARNING":
             severity = "WARN"
-        elif severity == "CRITICAL" or severity == "FATAL":
+        elif severity in ("CRITICAL", "FATAL"):
             severity = "CRITICAL"
 
-    # Message is the line without leading timestamp
+    req_match = REQUEST_ID_PATTERN.search(line)
+    request_id = req_match.group(0) if req_match else None
+
+    comp_match = COMPONENT_PATTERN.search(line)
+    component = comp_match.group(1) if comp_match else None
+
     message = line.strip()
-    return severity, message, timestamp
+    return severity, message, timestamp, component, request_id
 
 
-def parse_log_text(log_text: str) -> List[LogEntry]:
+def parse_log_text(log_text: str, source_id: Optional[str] = None) -> List[LogEntry]:
     """Parse raw log text into a list of LogEntry items, with stack traces grouped into parents."""
     if not log_text:
         return []
@@ -174,16 +235,31 @@ def parse_log_text(log_text: str) -> List[LogEntry]:
         if not stripped:
             continue
 
-        # Check if this line is a continuation / stack trace line for previous entry
-        if entries and STACK_TRACE_LINE_PATTERN.match(raw_line):
+        # Check if this line is continuation / stack trace line for previous entry
+        is_continuation = False
+        if entries:
+            prev_entry = entries[-1]
+            has_active_trace = len(prev_entry.stack_trace) > 0
+            is_indented = raw_line.startswith((" ", "\t"))
+            matches_pattern = bool(STACK_TRACE_START_PATTERN.match(raw_line))
+
+            # Continuation if pattern matches or if active trace and indented/exception
+            if matches_pattern:
+                is_continuation = True
+            elif has_active_trace and (is_indented or not TIMESTAMP_PATTERN.search(raw_line[:30])):
+                # Check that it's not a brand new log line with a timestamp
+                is_continuation = True
+            elif prev_entry.severity in ("ERROR", "CRITICAL", "FATAL") and (is_indented or "panic:" in prev_entry.raw_content):
+                is_continuation = True
+
+        if is_continuation:
             entries[-1].stack_trace.append(raw_line)
             continue
 
         # Check if line is structured JSON
         json_result = parse_json_log_line(raw_line)
         if json_result is not None:
-            sev, msg, ts, data = json_result
-            # Check for stack trace inside JSON
+            sev, msg, ts, comp, req_id, data = json_result
             stack: List[str] = []
             for stack_key in ("stack", "stack_trace", "stackTrace", "trace"):
                 if stack_key in data and isinstance(data[stack_key], str):
@@ -201,13 +277,15 @@ def parse_log_text(log_text: str) -> List[LogEntry]:
                     severity=sev,
                     message=msg,
                     timestamp=ts,
+                    component=comp,
+                    request_id=req_id,
+                    source_id=source_id,
                     stack_trace=stack,
                     parsed_json=data,
                 )
             )
         else:
-            # Plain-text line
-            sev, msg, ts = parse_plaintext_log_line(raw_line)
+            sev, msg, ts, comp, req_id = parse_plaintext_log_line(raw_line)
             entries.append(
                 LogEntry(
                     line_number=idx,
@@ -216,6 +294,9 @@ def parse_log_text(log_text: str) -> List[LogEntry]:
                     severity=sev,
                     message=msg,
                     timestamp=ts,
+                    component=comp,
+                    request_id=req_id,
+                    source_id=source_id,
                     stack_trace=[],
                 )
             )
@@ -224,10 +305,7 @@ def parse_log_text(log_text: str) -> List[LogEntry]:
 
 
 def matches_severity(entry_severity: Optional[str], target_severity: str) -> bool:
-    """Check if entry severity matches the target severity.
-
-    Supports 'ALL', 'ANY', exact match, or category matches (e.g. 'ERROR' includes CRITICAL/FATAL/ERROR).
-    """
+    """Check if entry severity matches the target severity."""
     target = target_severity.upper().strip()
     if target in ("ALL", "ANY"):
         return True
@@ -239,16 +317,10 @@ def matches_severity(entry_severity: Optional[str], target_severity: str) -> boo
     if entry_sev == target:
         return True
 
-    # Standard groupings:
-    # If target is ERROR: matches ERROR, CRITICAL, FATAL, SEVERE, EXCEPTION
     if target == "ERROR" and entry_sev in {"ERROR", "CRITICAL", "FATAL", "SEVERE", "EXCEPTION"}:
         return True
-
-    # If target is WARN / WARNING: matches WARN, WARNING
     if target in {"WARN", "WARNING"} and entry_sev in {"WARN", "WARNING"}:
         return True
-
-    # If target is CRITICAL: matches CRITICAL, FATAL, EMERGENCY
     if target in {"CRITICAL", "FATAL"} and entry_sev in {"CRITICAL", "FATAL", "EMERGENCY"}:
         return True
 

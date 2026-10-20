@@ -1,0 +1,20 @@
+{
+  "sources": [
+    {
+      "type": "local_file",
+      "source_id": "checkout-failing",
+      "name": "Checkout Service (Failing Run)",
+      "path": "examples/failing.log",
+      "allowed_root": "examples/",
+      "description": "Failing checkout API run with timeout retries"
+    },
+    {
+      "type": "local_file",
+      "source_id": "checkout-baseline",
+      "name": "Checkout Service (Baseline Run)",
+      "path": "examples/successful.log",
+      "allowed_root": "examples/",
+      "description": "Healthy baseline checkout execution"
+    }
+  ]
+}
