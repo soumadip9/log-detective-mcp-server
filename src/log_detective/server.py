@@ -191,7 +191,11 @@ def create_app() -> Any:
 
 
 def main() -> None:
-    """Entrypoint to run the server on the configured PORT and HOST."""
+    """Entrypoint to run the server on the configured PORT/HOST or stdio."""
+    if "--stdio" in sys.argv:
+        server.run(transport="stdio")
+        return
+
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     token_configured = bool(os.environ.get("MCP_AUTH_TOKEN") or os.environ.get("AUTH_TOKEN"))
@@ -205,3 +209,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
