@@ -1,211 +1,203 @@
 # Log Detective MCP 🔍
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![MCP](https://img.shields.io/badge/protocol-MCP%20Streamable%20HTTP-green.svg)](https://modelcontextprotocol.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![MCP](https://img.shields.io/badge/protocol-MCP%20v2%20Streamable%20HTTP-green.svg)](https://modelcontextprotocol.io/)
+[![Tests](https://img.shields.io/badge/tests-50%20passed-brightgreen.svg)](tests/)
 
-**Log Detective MCP** is a hosted Model Context Protocol (MCP) server that provides structured, safe, and stateless access to application logs. Connected AI clients like **Google Antigravity** can use Log Detective's debugging tools to discover errors, inspect surrounding execution context, and compare baseline vs. failing runs without mixing tenant data or requiring persistent storage.
+**Log Detective MCP** is a source-agnostic, multi-connector MCP server that lets AI clients like **Google Antigravity** discover, read, and investigate application logs from any authorized source — without you ever copying log text manually.
 
----
-
-## 📑 Table of Contents
-
-- [Overview & Architecture](#-overview--architecture)
-- [Tool Specifications](#-tool-specifications)
-- [Project Structure](#-project-structure)
-- [Quickstart & Local Development](#-quickstart--local-development)
-- [Running the Test Suite](#-running-the-test-suite)
-- [Deployment on Render](#-deployment-on-render)
-- [Connecting Antigravity](#-connecting-antigravity)
-- [Example Debugging Workflow](#-example-debugging-workflow)
-- [Security & Privacy Principles](#-security--privacy-principles)
-- [Acceptance Checklist](#-acceptance-checklist)
+> **What changed in v1.1**: The server now exposes two new tools (`list_log_sources`, `read_logs`) and a modular source connector architecture so AI clients can retrieve and investigate logs directly using only a `source_id`.
 
 ---
 
-## 🏛️ Overview & Architecture
-
-When diagnosing failures, AI assistants need relevant log evidence rather than entire gigabyte dump files. Log Detective exposes three focused tools designed specifically for incident diagnosis:
+## Architecture Overview
 
 ```
-+--------------------------+          +----------------------------------+
-|  Developer Application   |          |      Hosted Log Detective        |
-|  (Node, Python, Go, Java)|          |      Render (Streamable HTTP)    |
-|                          |          |                                  |
-|  Produces application    |          |  [find_errors]                   |
-|  logs (text or JSON)     |          |  [get_log_context]               |
-+------------+-------------+          |  [compare_logs]                  |
-             |                        +-----------------+----------------+
-             | Logs                                     ^
-             v                                          | MCP over Streamable HTTP
-+--------------------------+                            | (Bearer Auth + TLS)
-|    Antigravity / AI      |----------------------------+
-|    Client                |
-|                          |
-|  - Reads workspace logs  |
-|  - Invokes MCP tools     |
-|  - Explains root cause   |
-+--------------------------+
+┌────────────────────────────────────────────────────────────────────┐
+│                       Log Detective MCP Server                     │
+│                                                                    │
+│  Tools                 Source Connectors          Security         │
+│  ──────                ─────────────────          ────────         │
+│  list_log_sources  ──► LocalFileLogSource         Bearer Auth      │
+│  read_logs         ──► CapturedProcessLogSource   Allowlists       │
+│  find_errors       ──► DockerLogSource            Path Traversal   │
+│  get_log_context   ──► RemoteApiLogSource         Secret Redact    │
+│  compare_logs          LogSourceRegistry          Input Bounds     │
+└──────────────────────────┬─────────────────────────────────────────┘
+                           │ MCP over Streamable HTTP (TLS)
+                           │ or stdio (local)
+                    ┌──────┴──────┐
+                    │  Antigravity │
+                    │  AI Client   │
+                    └─────────────┘
 ```
 
-### Key Product Boundaries
-- **Stateless by Design**: Tools accept log text as direct arguments and return structured results immediately. No database, S3 bucket, or persistent log store is required for MVP.
-- **Evidence Retrieval Only**: Log Detective retrieves and organizes empirical evidence (line numbers, stack traces, diffs). It does not edit source code, execute arbitrary shell commands, or make subjective assumptions regarding causation.
+### Key Design Principles
+
+- **Stateless analysis**: Tools work on log text in memory — no persistent database.
+- **Source abstraction**: Connectors are registered per source ID; AI clients never supply raw file paths.
+- **Fail-closed security**: Unauthorized paths, oversized inputs, and invalid source IDs are always rejected.
+- **Evidence-only**: Log Detective retrieves and organizes evidence. It does not modify code, execute shell commands, or determine root cause autonomously.
 
 ---
 
-## 🛠️ Tool Specifications
+## Five MCP Tools
 
-### 1. `find_errors`
-Scans raw log text (plain-text or JSON lines) for error events, stack traces, and failure indicators.
-- **Inputs**:
-  - `log_text` *(string, required)*: Raw log content to inspect.
-  - `severity` *(string, optional, default: `"ERROR"`)*: Severity filter (`"ERROR"`, `"WARN"`, `"CRITICAL"`, `"INFO"`, `"ALL"`).
-  - `limit` *(integer, optional, default: `50`, max: `200`)*: Maximum results returned.
-- **Returns**: Total lines, matching count, line numbers, timestamps, messages, and grouped multiline stack traces.
+| Tool | Purpose | Primary Inputs |
+|------|---------|---------------|
+| `list_log_sources` | Discover configured, authorized sources | — |
+| `read_logs` | Fetch recent entries from a source | `source_id`, `limit`, `severity`, `search_term` |
+| `find_errors` | Scan for errors and stack traces | `source_id` **or** `log_text`, `severity`, `limit` |
+| `get_log_context` | View context around a line number | `target_line`, `source_id` **or** `log_text` |
+| `compare_logs` | Diff baseline vs. failing run | `baseline_source_id` + `failing_source_id` **or** text |
 
-### 2. `get_log_context`
-Retrieves surrounding lines of context before and after a specific target line.
-- **Inputs**:
-  - `log_text` *(string, required)*: Raw log content.
-  - `target_line` *(integer, required)*: 1-indexed line number to center the window on.
-  - `context_size` *(integer, optional, default: `5`, max: `50`)*: Number of lines before and after.
-- **Returns**: Bounded context window, target indicator (`is_target: true`), and formatted text block with `>` marker.
-
-### 3. `compare_logs`
-Compares a known healthy baseline log run against a failing log run to identify behavioral divergences.
-- **Inputs**:
-  - `baseline_log` *(string, required)*: Healthy execution log.
-  - `failing_log` *(string, required)*: Failing execution log.
-- **Returns**: Added events (new errors/warnings), missing events (expected steps that didn't complete), frequency changes (retry loops), and an explicit non-causation disclaimer.
+All existing text-based workflows remain backward-compatible.
 
 ---
 
-## 📁 Project Structure
+## Source Connector Types
+
+| Type | Class | When to use |
+|------|-------|-------------|
+| `local_file` | `LocalFileLogSource` | App writes to a file; full path traversal protection |
+| `captured_process` | `CapturedProcessLogSource` | App stdout/stderr redirected to a spool file |
+| `docker` | `DockerLogSource` | Container logs via Docker SDK (container allowlisted) |
+| `remote_api` | `RemoteApiLogSource` | Internal HTTPS log API (domain allowlisted, no SSRF) |
+
+---
+
+## Project Structure
 
 ```
 log-detective-mcp/
 ├── src/
 │   └── log_detective/
-│       ├── __init__.py      # Package initialization
-│       ├── server.py        # MCPServer instance, Starlette app, HTTP transport & auth
-│       ├── tools.py         # The 3 MCP tools implementation
-│       ├── parsers.py       # Plaintext and JSON line parsers, normalizer
-│       └── validators.py    # Input validation, bounds & security guards
+│       ├── __init__.py
+│       ├── server.py          # MCPServer, Streamable HTTP, auth, tool registration
+│       ├── tools.py           # All 5 tool implementations
+│       ├── parsers.py         # Multi-language log parsing & normalization
+│       ├── validators.py      # Input bounds & argument validation
+│       ├── security.py        # Secret redaction, path traversal validation
+│       └── sources/
+│           ├── __init__.py
+│           ├── base.py        # BaseLogSource abstract interface
+│           ├── registry.py    # LogSourceRegistry — register/discover sources
+│           ├── local_file.py  # Local file connector (path-traversal-safe)
+│           ├── process.py     # Captured process spool connector
+│           ├── docker.py      # Docker SDK connector (allowlisted only)
+│           └── remote.py      # Remote HTTP API connector (SSRF-safe)
 ├── tests/
-│   ├── test_find_errors.py  # Phase 2 test suite
-│   ├── test_log_context.py  # Phase 3 test suite
-│   ├── test_compare_logs.py # Phase 4 test suite
-│   └── test_server.py       # Phase 5 & 6 server, discovery, health & auth tests
+│   ├── test_compare_logs.py
+│   ├── test_find_errors.py
+│   ├── test_log_context.py
+│   ├── test_server.py
+│   ├── test_parsers_multilang.py   # Python, Node.js, Java, Go parsing
+│   ├── test_security_redaction.py  # Secret/credential redaction
+│   ├── test_sources_local.py       # Path traversal, permission errors
+│   ├── test_sources_process.py
+│   ├── test_sources_docker.py      # Mocked Docker SDK
+│   ├── test_sources_remote.py      # SSRF prevention, mocked HTTP
+│   └── test_tools_discovery_retrieval.py
 ├── examples/
-│   ├── successful.log       # Reproducible baseline checkout log
-│   └── failing.log          # Reproducible failing checkout log (timeouts & retries)
-├── requirements.txt         # Pinned production & development dependencies
-├── pyproject.toml           # Standard Python packaging configuration
-├── .gitignore
-└── README.md
+│   ├── successful.log
+│   └── failing.log
+├── sources.json              # Active source configuration
+├── sources.example.json      # Documented example configuration
+├── .env.example              # Environment variable reference
+├── requirements.txt
+└── pyproject.toml
 ```
 
 ---
 
-## 🚀 Quickstart & Local Development
+## Quickstart: Local Development
 
-### 1. Prerequisites
-- Python 3.11 or higher
-- Git
+### 1. Install
 
-### 2. Install Dependencies
 ```bash
 git clone https://github.com/prasa/log-detective-mcp.git
 cd log-detective-mcp
-
-# Install dependencies in editable mode
 pip install -r requirements.txt
 pip install -e .
 ```
 
-### 3. Run the Server Locally
-```bash
-# Optional: Set a local auth token
-export MCP_AUTH_TOKEN="my-secret-token"
+### 2. Configure Sources
 
-# Start server
+Copy and edit the example configuration:
+
+```bash
+cp sources.example.json sources.json
+```
+
+Edit `sources.json` to point to your actual log files:
+
+```json
+{
+  "sources": [
+    {
+      "type": "local_file",
+      "source_id": "my-app",
+      "name": "My Application Log",
+      "path": "logs/app.log",
+      "allowed_root": "logs/",
+      "description": "FastAPI backend application log"
+    }
+  ]
+}
+```
+
+> **Security**: Only files inside `allowed_root` are accessible. Path traversal attempts (`../etc/passwd`) are always rejected.
+
+### 3. Run Locally
+
+```bash
+# Optional auth token for remote deployments
+export MCP_AUTH_TOKEN=my-secret-token
+
 python -m log_detective.server
 ```
-The server will start listening on `http://0.0.0.0:8000`:
-- **Health check**: `http://localhost:8000/health`
-- **MCP Streamable HTTP Endpoint**: `http://localhost:8000/mcp`
 
-### 4. Test with the Official MCP Inspector
-You can test tool discovery and execution locally using the MCP Inspector:
-```bash
-npx @modelcontextprotocol/inspector
-```
-Connect via transport: `Streamable HTTP` with URL `http://localhost:8000/mcp` (and header `Authorization: Bearer my-secret-token` if configured).
+Server starts at `http://0.0.0.0:8000`:
+- **Health**: `GET /health`
+- **MCP**: `POST /mcp` (Streamable HTTP)
 
----
-
-## 🧪 Running the Test Suite
-
-Log Detective includes a comprehensive pytest suite covering all input validations, parser edge cases, stack traces, and security limits:
+### 4. Test
 
 ```bash
-pytest -v
-```
-
-Expected result:
-```
-============================= 21 passed in 2.06s ==============================
+pytest -v  # 50 tests, all passing
 ```
 
 ---
 
-## ☁️ Deployment on Render
+## Connecting Antigravity (Local stdio)
 
-Deploy Log Detective as a **Render Web Service** for a public HTTPS endpoint.
-
-### Step 1: Push Repository to GitHub
-```bash
-git add .
-git commit -m "Initial release of Log Detective MCP v1.0.0"
-git remote add origin https://github.com/YOUR_USERNAME/log-detective-mcp.git
-git push -u origin master
-```
-
-### Step 2: Create a Web Service on Render
-1. Open the [Render Dashboard](https://dashboard.render.com/) and click **New +** → **Web Service**.
-2. Select your `log-detective-mcp` GitHub repository.
-3. Configure the service settings:
-   - **Name**: `log-detective-mcp`
-   - **Region**: Select your preferred region (e.g., Oregon, Frankfurt)
-   - **Branch**: `master` (or `main`)
-   - **Runtime**: `Python 3`
-   - **Build Command**: `pip install -r requirements.txt && pip install -e .`
-   - **Start Command**: `python -m log_detective.server`
-   - **Instance Type**: `Free` or `Starter`
-4. Add **Environment Variables**:
-   - `MCP_AUTH_TOKEN`: Generate a strong random token (e.g. `openssl rand -hex 24`).
-   - *(Note: Render automatically supplies `PORT`, which our server automatically binds to).*
-5. Set Health Check Path:
-   - **Health Check Path**: `/health`
-6. Click **Create Web Service**.
-
-Once deployed, your public MCP endpoint will be:
-```
-https://log-detective-mcp.onrender.com/mcp
-```
-
----
-
-## 🤖 Connecting Antigravity
-
-Add your hosted server to your Antigravity MCP configuration (`settings.json` or project MCP configuration):
+Edit `~/.gemini/config/mcp_config.json`:
 
 ```json
 {
   "mcpServers": {
     "log-detective": {
-      "serverUrl": "https://log-detective-mcp.onrender.com/mcp",
+      "command": "python",
+      "args": ["-m", "log_detective.server", "--stdio"],
+      "cwd": "C:\\path\\to\\log-detective-mcp"
+    }
+  }
+}
+```
+
+Restart Antigravity — it will discover all 5 tools automatically.
+
+---
+
+## Connecting Antigravity (Remote / Render)
+
+After deploying to Render (see below):
+
+```json
+{
+  "mcpServers": {
+    "log-detective": {
+      "serverUrl": "https://YOUR-SERVICE.onrender.com/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_MCP_AUTH_TOKEN"
       }
@@ -214,80 +206,192 @@ Add your hosted server to your Antigravity MCP configuration (`settings.json` or
 }
 ```
 
-> **Security Note**: Never commit actual authentication tokens to public version control.
+---
 
-Once added, restart or refresh Antigravity's MCP server panel. Antigravity will discover the three tools:
-- `find_errors`
-- `get_log_context`
-- `compare_logs`
+## Registering a New Log Source
+
+### Option A: `sources.json` file (recommended)
+
+```json
+{
+  "sources": [
+    {
+      "type": "local_file",
+      "source_id": "backend-api",
+      "name": "Backend API",
+      "path": "/var/log/myapp/api.log",
+      "allowed_root": "/var/log/myapp/",
+      "description": "Production FastAPI log"
+    },
+    {
+      "type": "docker",
+      "source_id": "redis-cache",
+      "name": "Redis Container",
+      "container": "redis-prod",
+      "allowlisted_containers": ["redis-prod"]
+    }
+  ]
+}
+```
+
+### Option B: Single file via environment variable
+
+```bash
+export LOG_DETECTIVE_LOG_FILE=/var/log/myapp/app.log
+python -m log_detective.server
+```
+
+This auto-registers a source with `source_id="app-log"`.
+
+### Option C: Programmatically
+
+```python
+from log_detective.sources.local_file import LocalFileLogSource
+from log_detective.sources.registry import default_registry
+
+default_registry.register_source(
+    LocalFileLogSource(
+        source_id="my-api",
+        name="My API Logs",
+        file_path="/var/log/api/app.log",
+        allowed_root="/var/log/api/",
+    )
+)
+```
 
 ---
 
-## 💡 Example Debugging Workflow
+## Example Workflows in Antigravity
 
-With Log Detective connected, you can prompt Antigravity:
+### Workflow 1: Discover and investigate
 
-> *"Investigate why my checkout API is failing. Read the workspace log at `examples/failing.log` and use Log Detective to examine the evidence."*
+> *"List available log sources, then find all errors in the checkout service."*
 
-### Step-by-Step AI Execution
-1. **Fetch Log Content**: Antigravity reads `examples/failing.log` from the workspace.
-2. **Find Errors**:
-   ```json
-   find_errors({
-     "log_text": "...",
-     "severity": "ERROR"
-   })
-   ```
-   *Result*: Discovers `PaymentGateway: Failed to authorize transaction after 3 retries: GatewayTimeoutException` on Line 9.
-3. **Inspect Context**:
-   ```json
-   get_log_context({
-     "log_text": "...",
-     "target_line": 9,
-     "context_size": 4
-   })
-   ```
-   *Result*: Reveals lines 5–8 showing 3 repeated 5000ms timeouts contacting Stripe before the error was thrown.
-4. **Compare with Baseline**:
-   ```json
-   compare_logs({
-     "baseline_log": "<content of examples/successful.log>",
-     "failing_log": "<content of examples/failing.log>"
-   })
-   ```
-   *Result*: Highlights that `txn_9918237461` and order database write are missing, replaced by Stripe read timeout and inventory rollback.
-5. **AI Synthesis**: The AI explains to the developer that Stripe API timeouts caused 3 failed retries leading to the 504 Gateway Timeout, and provides actionable remediation steps.
+Antigravity calls:
+1. `list_log_sources()` → sees `checkout-failing`, `checkout-baseline`
+2. `find_errors(source_id="checkout-failing")` → 2 errors, line numbers, stack traces
+3. `get_log_context(target_line=9, source_id="checkout-failing")` → 5-line window
+
+### Workflow 2: Compare runs
+
+> *"Compare the baseline and failing checkout logs and explain what changed."*
+
+```
+compare_logs(
+  baseline_source_id="checkout-baseline",
+  failing_source_id="checkout-failing"
+)
+```
+
+Returns: added events (timeouts, 504 errors), missing events (payment auth, order confirmed), frequency divergences.
+
+### Workflow 3: Search for a specific error
+
+> *"Search the backend logs for any Redis connection errors."*
+
+```
+read_logs(source_id="backend-api", search_term="Redis", severity="ERROR")
+```
 
 ---
 
-## 🔒 Security & Privacy Principles
+## Deployment on Render
 
-- **Zero-Storage Privacy**: No customer logs are written to database or persistent disk. Logs exist only in transient memory during tool execution.
-- **Safe Parsing (Untrusted Input)**: Log entries are treated as untrusted text strings. Malformed lines, injection strings, or instructional prompt injection embedded inside logs are never evaluated as code or system commands.
-- **Bounded Resources**:
-  - Maximum log payload: 5 MB (`MAX_LOG_SIZE_BYTES`)
-  - Maximum context window: 50 lines (`MAX_CONTEXT_SIZE`)
-  - Maximum error limit: 200 items (`MAX_FIND_ERRORS_LIMIT`)
-- **Sanitized Operational Logs**: The server logs operational metrics (request count, tool names, timing) but explicitly suppresses raw log bodies and Bearer tokens.
-- **Non-Causation Disclaimer**: All comparative diffs clearly state that differences indicate correlation and empirical evidence, not proven causation.
+1. Push to GitHub.
+2. Create **Render Web Service** from your repository.
+3. Configure:
+   - **Build**: `pip install -r requirements.txt && pip install -e .`
+   - **Start**: `python -m log_detective.server`
+   - **Health Check Path**: `/health`
+4. Set **Environment Variables**:
+   - `MCP_AUTH_TOKEN`: A strong random secret (`openssl rand -hex 24`)
+   - `PORT`: Set automatically by Render
+   - `LOG_DETECTIVE_SOURCES_CONFIG`: Path to your `sources.json`
 
----
-
-## ✅ Acceptance Checklist
-
-| Requirement | Status | Verification |
-|---|:---:|---|
-| **All three tools work** | ✅ | Unit tested across JSON, plaintext & stack traces |
-| **Inputs are bounded** | ✅ | Guards for oversized logs, invalid line numbers & context size |
-| **MCP Inspector succeeds** | ✅ | Discovers and executes tools over Streamable HTTP |
-| **Remote deployment ready** | ✅ | Binds to `0.0.0.0` and `$PORT`, handles reverse proxies |
-| **Antigravity connects** | ✅ | Configured via `serverUrl` and Bearer token headers |
-| **Evidence is useful** | ✅ | Line numbers, context window markers, stack traces |
-| **Security checks pass** | ✅ | 401 on missing/bad token, no logs/secrets in stdout |
-| **README complete** | ✅ | Full deployment & configuration instructions |
+MCP endpoint: `https://YOUR-SERVICE.onrender.com/mcp`
 
 ---
 
-## 📄 License
+## Security Limitations
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+- **Redaction is best-effort**: Secret patterns are detected heuristically. Do not rely on redaction alone — use access controls and least-privilege permissions.
+- **Local files only serve allowlisted paths**: Any path outside `allowed_root` is rejected with a path traversal error regardless of caller-supplied path.
+- **Docker allowlists are required**: The Docker connector rejects any container not in `allowlisted_containers`.
+- **Remote API domain allowlists prevent SSRF**: Only explicitly configured domains (including subdomains) are permitted.
+- **No arbitrary shell execution**: The server never runs shell commands, terminates processes, or modifies files.
+- **DNS rebinding protection**: Disabled for reverse-proxy compatibility on Render. On local networks, consider re-enabling `TransportSecuritySettings(enable_dns_rebinding_protection=True)`.
+
+---
+
+## Optional Connector: Docker
+
+Docker support requires the `docker` Python SDK:
+
+```bash
+pip install docker
+```
+
+Then add a Docker source to `sources.json`:
+
+```json
+{
+  "type": "docker",
+  "source_id": "web-api",
+  "name": "Web API Container",
+  "container": "web-api-prod",
+  "allowlisted_containers": ["web-api-prod"]
+}
+```
+
+The server works without Docker installed (local file mode is unaffected).
+
+---
+
+## Optional Connector: Remote API
+
+Add a remote source with an explicitly allowed domain:
+
+```json
+{
+  "type": "remote_api",
+  "source_id": "central-logs",
+  "name": "Internal Log Service",
+  "endpoint_url": "https://logs.internal.mycompany.com/v1/query",
+  "allowed_domains": ["internal.mycompany.com"],
+  "auth_token": "your-token-here"
+}
+```
+
+Only `https://` URLs whose hostname matches an allowed domain are contacted. Requests to cloud metadata services, internal network IPs, or unapproved hostnames are rejected with a `PermissionError`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `source_id 'X' is not configured` | Source missing from `sources.json` | Add it and restart server |
+| `Path traversal detected` | File path escapes `allowed_root` | Ensure `path` is inside `allowed_root` |
+| `Permission denied` | File permissions | Check OS-level read access |
+| `401 Unauthorized` | Wrong/missing Bearer token | Set `Authorization: Bearer <token>` header |
+| Tools not showing in Antigravity | Stale MCP server cache | Refresh MCP servers in Antigravity settings |
+| Docker source unavailable | `docker` package not installed | `pip install docker` |
+
+---
+
+## Acceptance Checklist (v1.1 Complete)
+
+| Requirement | Status |
+|-------------|--------|
+| All 5 tools work | ✅ |
+| Source ID → direct log retrieval | ✅ |
+| Local file connector with path traversal protection | ✅ |
+| Captured process connector | ✅ |
+| Docker connector (mocked, allowlisted) | ✅ |
+| Remote API connector (SSRF-safe) | ✅ |
+| Secret redaction for tokens, passwords, API keys | ✅ |
+| Multi-language parsing (Python, Node.js, Java, Go) | ✅ |
+| Antigravity connected via stdio locally | ✅ |
+| Bearer auth for remote deployments | ✅ |
+| 50 tests passing | ✅ |
+| README with full instructions | ✅ |
